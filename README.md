@@ -71,6 +71,23 @@ The parser generates the following worksheets:
 - Teams
 
 ---
+## Example Output
+
+### Workload Summary
+
+![Workload Summary](screenshots/workload-summary.png)
+
+### IP Analysis
+
+![IP Analysis](screenshots/ip-analysis.png)
+
+### Exchange Investigation
+
+![Exchange Investigation](screenshots/exchange-investigation.png)
+
+### SharePoint/OneDrive Investigation
+
+![SharePoint](screenshots/sharepoint-investigation.png)
 
 ## Installation
 
