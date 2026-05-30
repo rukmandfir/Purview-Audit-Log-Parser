@@ -1,3 +1,6 @@
+![Version](https://img.shields.io/badge/version-v1.0.0-blue)
+![Python](https://img.shields.io/badge/python-3.x-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 # Purview Audit Log Parser
 
 A Python-based parser for Microsoft Purview Audit Log exports, built to support Microsoft 365 incident response and digital forensic investigations.
