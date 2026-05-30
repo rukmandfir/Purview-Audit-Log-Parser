@@ -1,0 +1,13 @@
+input/
+output/
+
+input/*.csv
+output/*.xlsx
+
+__pycache__/
+*.pyc
+
+.vscode/
+.idea/
+
+.env
