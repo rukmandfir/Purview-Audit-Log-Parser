@@ -4,8 +4,8 @@ from pathlib import Path
 import pandas as pd
 
 
-INPUT_FILE = Path("input/purview_audit_log_InsiderThreat.csv")
-OUTPUT_FILE = Path("output/purview_parsed_InsiderThreat.xlsx")
+INPUT_FILE = Path("input/purview_audit_log_BEC.csv")
+OUTPUT_FILE = Path("output/purview_parsed_BEC.xlsx")
 
 BASE_COLUMNS = ["RecordId", "CreationDate", "RecordType", "Operation", "UserId"]
 
@@ -787,6 +787,36 @@ def create_potential_incidents(combined):
                 time_window_minutes=60,
             )
 
+        if bec_events.empty:
+            bec_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "userloggedin",
+                    "new-inboxrule",
+                ],
+                time_window_minutes=60,
+            )
+
+        if bec_events.empty:
+            bec_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "userloggedin",
+                    "set-inboxrule",
+                ],
+                time_window_minutes=60,
+            )
+
+        if bec_events.empty:
+            bec_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "userloggedin",
+                    "updateinboxrules",
+                ],
+                time_window_minutes=60,
+            )
+
         if not bec_events.empty:
             incidents.append(
                 build_potential_incident(
@@ -795,7 +825,7 @@ def create_potential_incidents(combined):
                     severity="Critical",
                     confidence_score=95,
                     events=bec_events,
-                    reason="Mailbox access and inbox rule activity observed within 60 minutes. Analyst review recommended.",
+                    reason="Mailbox access or successful login followed by inbox rule activity within 60 minutes. Review recommended.",
                     time_window_minutes=60,
                 )
             )
