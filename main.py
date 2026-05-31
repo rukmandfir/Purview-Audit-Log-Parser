@@ -79,6 +79,15 @@ AZURE_AD_INVESTIGATION_COLUMNS = [
     "DeviceDisplayName", "ActorIpAddress",
 ]
 
+TIMELINE_COLUMNS = [
+    "RecordId", "RecordType", "CreationDate", "EventTimestamp", "ParserConnector", "Workload",
+    "Operation", "UserId", "PrimaryUser", "NormalisedIPAddress",
+    "IPAddressSource", "SuspicionScore", "Severity",
+    "SuspicionReason", "EventSummary",
+]
+
+SUSPICIOUS_ACTIVITY_COLUMNS = TIMELINE_COLUMNS
+
 
 def parse_audit_data(value):
     if pd.isna(value):
@@ -151,15 +160,9 @@ def extract_rule_field(row, field_name):
 
 def normalise_inbox_rule_fields(df):
     rule_fields = [
-        "RuleName",
-        "ForwardTo",
-        "RedirectTo",
-        "MoveToFolder",
-        "DeleteMessage",
-        "MarkAsRead",
-        "StopProcessingRules",
-        "SubjectContainsWords",
-        "From",
+        "RuleName", "ForwardTo", "RedirectTo", "MoveToFolder",
+        "DeleteMessage", "MarkAsRead", "StopProcessingRules",
+        "SubjectContainsWords", "From",
     ]
 
     output = df.copy()
@@ -352,6 +355,247 @@ def create_ip_analysis(combined):
     )
 
 
+def get_severity(score):
+    if score >= 90:
+        return "Critical"
+    if score >= 70:
+        return "High"
+    if score >= 40:
+        return "Medium"
+    if score > 0:
+        return "Low"
+    return ""
+
+def is_external_email(value, internal_domains=None):
+    if internal_domains is None:
+        internal_domains = ["contoso.com"]
+
+    value = str(value).lower().strip()
+
+    if not value or "@" not in value:
+        return False
+
+    return not any(value.endswith(f"@{domain}") for domain in internal_domains)
+
+def assess_suspicion(row):
+    operation = str(row.get("Operation", "")).lower()
+    reasons = []
+    score = 0
+
+    high_risk_operations = {
+        "new-inboxrule": 90,
+        "set-inboxrule": 90,
+        "updateinboxrules": 90,
+        "harddelete": 80,
+        "softdelete": 70,
+        "anonymouslinkcreated": 80,
+        "filesyncdownloadedfull": 70,
+    }
+
+    medium_risk_operations = {
+        "mailitemsaccessed": 60,
+        "searchqueryinitiated": 50,
+        "filedownloaded": 50,
+        "sharingset": 50,
+        "userloggedinfailed": 30,
+    }
+
+    for op, value in high_risk_operations.items():
+        if op in operation:
+            score = max(score, value)
+            reasons.append(f"High-risk operation: {row.get('Operation', '')}")
+
+    for op, value in medium_risk_operations.items():
+        if op in operation:
+            score = max(score, value)
+            reasons.append(f"Review operation: {row.get('Operation', '')}")
+
+    for field in ["ForwardTo", "RedirectTo"]:
+        value = row.get(field)
+
+        if pd.notna(value) and str(value).strip():
+            score = max(score, 90)
+            reasons.append(f"Inbox rule contains {field}")
+
+            if is_external_email(value):
+                score = max(score, 95)
+                reasons.append(
+                    f"Inbox rule forwards or redirects to external address: {field}"
+                )
+
+    move_to_folder = str(row.get("MoveToFolder", "")).lower()
+
+    suspicious_folders = [
+        "deleted",
+        "deleted items",
+        "rss",
+        "rss feeds",
+        "archive",
+        "junk",
+        "junk email",
+    ]
+
+    if any(folder in move_to_folder for folder in suspicious_folders):
+        score = max(score, 80)
+        reasons.append(
+            f"Inbox rule moves mail to suspicious folder: {row.get('MoveToFolder')}"
+        )
+
+    for field in ["DeleteMessage", "MarkAsRead", "StopProcessingRules"]:
+        value = str(row.get(field, "")).lower()
+        if value in ["true", "yes", "1"]:
+            score = max(score, 80)
+            reasons.append(f"Inbox rule option enabled: {field}")
+
+    sharing_scope = str(row.get("SharingLinkScope", "")).lower()
+    if sharing_scope in ["anonymous", "anyone"]:
+        score = max(score, 80)
+        reasons.append("Anonymous or Anyone sharing link")
+
+    managed_device = str(row.get("IsManagedDevice", "")).lower()
+    if managed_device == "false":
+        score = max(score, 40)
+        reasons.append("Unmanaged device")
+
+    return pd.Series({
+        "SuspicionScore": score,
+        "Severity": get_severity(score),
+        "SuspicionReason": "; ".join(sorted(set(reasons))) if reasons else "",
+    })
+
+def create_event_summary(row):
+    operation = str(row.get("Operation", ""))
+    operation_lower = operation.lower()
+    user = row.get("PrimaryUser") or row.get("UserId", "")
+    ip = row.get("NormalisedIPAddress", "")
+    workload = row.get("Workload") or row.get("ParserConnector", "")
+
+    if "new-inboxrule" in operation_lower:
+        summary = "Inbox rule created"
+    elif "set-inboxrule" in operation_lower or "updateinboxrules" in operation_lower:
+        summary = "Inbox rule modified"
+    elif "remove-inboxrule" in operation_lower:
+        summary = "Inbox rule removed"
+    elif "mailitemsaccessed" in operation_lower:
+        mail_access_type = row.get("MailAccessType", "")
+        summary = f"Mailbox items accessed ({mail_access_type})" if mail_access_type else "Mailbox items accessed"
+    elif "searchqueryinitiated" in operation_lower:
+        summary = "Mailbox search performed"
+    elif "harddelete" in operation_lower:
+        summary = "Email items hard deleted"
+    elif "softdelete" in operation_lower:
+        summary = "Email items soft deleted"
+    elif "filedownloaded" in operation_lower:
+        file_name = row.get("SourceFileName", "")
+        summary = f"File downloaded: {file_name}" if file_name else "File downloaded"
+    elif "filesyncdownloadedfull" in operation_lower:
+        file_name = row.get("SourceFileName", "")
+        summary = f"File synced/downloaded: {file_name}" if file_name else "File synced/downloaded"
+    elif "anonymouslinkcreated" in operation_lower:
+        summary = "Anonymous sharing link created"
+    elif "sharingset" in operation_lower:
+        summary = "Sharing permissions changed"
+    elif "userloggedinfailed" in operation_lower:
+        summary = "Failed user login"
+    elif "userloggedin" in operation_lower:
+        summary = "Successful user login"
+    else:
+        summary = operation
+
+    context = []
+
+    if user:
+        context.append(f"user={user}")
+
+    if ip:
+        context.append(f"ip={ip}")
+
+    if workload:
+        context.append(f"workload={workload}")
+
+    if context:
+        return f"{summary} | " + " | ".join(context)
+
+    return summary
+
+
+def create_investigation_timeline(combined):
+    timeline = combined.copy()
+
+    suspicion = timeline.apply(assess_suspicion, axis=1)
+    timeline = pd.concat([timeline, suspicion], axis=1)
+
+    timeline["Severity"] = timeline["Severity"].fillna("")
+    timeline["SuspicionReason"] = timeline["SuspicionReason"].fillna("")
+
+    timeline["EventSummary"] = timeline.apply(create_event_summary, axis=1)
+
+    timeline = add_failed_logon_patterns(timeline)
+
+    timeline = ensure_columns(timeline, TIMELINE_COLUMNS)
+
+    timeline = timeline.sort_values(
+        by="CreationDate",
+        ascending=True,
+        na_position="last",
+    )
+
+    return timeline
+
+
+def create_suspicious_activity(timeline):
+    suspicious = timeline[
+        timeline["SuspicionScore"].fillna(0).astype(int) > 0
+    ].copy()
+
+    return ensure_columns(suspicious, SUSPICIOUS_ACTIVITY_COLUMNS)
+
+def add_failed_logon_patterns(timeline):
+    output = timeline.copy()
+
+    failed_logons = output[
+        output["Operation"].astype(str).str.lower() == "userloggedinfailed"
+    ].copy()
+
+    if failed_logons.empty:
+        return output
+
+    failed_counts = (
+        failed_logons
+        .groupby(["PrimaryUser", "NormalisedIPAddress"])
+        .size()
+        .reset_index(name="FailedLogonCount")
+    )
+
+    high_failed = failed_counts[failed_counts["FailedLogonCount"] >= 5]
+
+    for _, row in high_failed.iterrows():
+        user = row["PrimaryUser"]
+        ip = row["NormalisedIPAddress"]
+        count = row["FailedLogonCount"]
+
+        mask = (
+            (output["PrimaryUser"] == user)
+            & (output["NormalisedIPAddress"] == ip)
+            & (output["Operation"].astype(str).str.lower() == "userloggedinfailed")
+        )
+
+        output.loc[mask, "SuspicionScore"] = output.loc[mask, "SuspicionScore"].apply(
+            lambda current: max(int(current), 70)
+        )
+
+        output.loc[mask, "Severity"] = output.loc[mask, "SuspicionScore"].apply(get_severity)
+
+        output.loc[mask, "SuspicionReason"] = output.loc[mask, "SuspicionReason"].apply(
+            lambda reason: (
+                f"{reason}; Multiple failed logons from same IP ({count})"
+                if reason
+                else f"Multiple failed logons from same IP ({count})"
+            )
+        )
+
+    return output
+
 def main():
     OUTPUT_FILE.parent.mkdir(exist_ok=True)
 
@@ -412,6 +656,9 @@ def main():
     )
 
     ip_analysis = create_ip_analysis(combined)
+
+    investigation_timeline = create_investigation_timeline(combined)
+    suspicious_activity = create_suspicious_activity(investigation_timeline)
 
     mail_items_accessed = combined[
         combined["Operation"].astype(str).str.lower() == "mailitemsaccessed"
@@ -502,6 +749,8 @@ def main():
         {
             "Metric": [
                 "Total Events",
+                "Investigation Timeline Events",
+                "Suspicious Activity Events",
                 "Exchange Investigation Events",
                 "Inbox Rule Events",
                 "SharePoint-OneDrive Investigation Events",
@@ -522,6 +771,8 @@ def main():
             ],
             "Count": [
                 len(combined),
+                len(investigation_timeline),
+                len(suspicious_activity),
                 len(exchange_investigation),
                 len(inbox_rules),
                 len(spod_output),
@@ -547,6 +798,8 @@ def main():
         stats.to_excel(writer, sheet_name="Parser Statistics", index=False)
         workload_summary.to_excel(writer, sheet_name="Workload Summary", index=False)
         ip_analysis.to_excel(writer, sheet_name="IP-Analysis", index=False)
+        investigation_timeline.to_excel(writer, sheet_name="Investigation-Timeline", index=False)
+        suspicious_activity.to_excel(writer, sheet_name="Suspicious-Activity", index=False)
         combined.to_excel(writer, sheet_name="All Events", index=False)
         parser_errors.to_excel(writer, sheet_name="Parser Errors", index=False)
 
