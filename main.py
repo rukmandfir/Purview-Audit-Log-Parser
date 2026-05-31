@@ -4,8 +4,8 @@ from pathlib import Path
 import pandas as pd
 
 
-INPUT_FILE = Path("input/purview_audit_log.csv")
-OUTPUT_FILE = Path("output/purview_parsed.xlsx")
+INPUT_FILE = Path("input/purview_audit_log_InsiderThreat.csv")
+OUTPUT_FILE = Path("output/purview_parsed_InsiderThreat.xlsx")
 
 BASE_COLUMNS = ["RecordId", "CreationDate", "RecordType", "Operation", "UserId"]
 
@@ -87,6 +87,11 @@ TIMELINE_COLUMNS = [
 ]
 
 SUSPICIOUS_ACTIVITY_COLUMNS = TIMELINE_COLUMNS
+
+POTENTIAL_INCIDENTS_COLUMNS = [
+    "PrimaryUser", "Pattern", "Severity", "ConfidenceScore", "FirstSeen", "LastSeen", "TimeWindowMinutes", "SupportingOperations", "SupportingIPs",
+    "EventCount", "Reason",
+]
 
 
 def parse_audit_data(value):
@@ -398,7 +403,24 @@ def assess_suspicion(row):
         "filedownloaded": 50,
         "sharingset": 50,
         "userloggedinfailed": 30,
+	"filerecycled": 70,
     }
+
+    external_domains = [
+    	"gmail.com",
+    	"outlook.com",
+    	"hotmail.com",
+    	"yahoo.com",
+    	"icloud.com",
+    	"proton.me",
+    	"protonmail.com",
+    ]
+
+    recipient = str(row.get("Recipient", "")).lower()
+
+    if any(domain in recipient for domain in external_domains):
+    	score = max(score, 70)
+    	reasons.append("Email sent to external personal mailbox")
 
     for op, value in high_risk_operations.items():
         if op in operation:
@@ -451,6 +473,22 @@ def assess_suspicion(row):
     if sharing_scope in ["anonymous", "anyone"]:
         score = max(score, 80)
         reasons.append("Anonymous or Anyone sharing link")
+
+    external_domains = [
+    	"gmail.com",
+    	"outlook.com",
+    	"hotmail.com",
+    	"yahoo.com",
+    	"icloud.com",
+    	"proton.me",
+    	"protonmail.com",
+     ]
+
+    recipient = str(row.get("Recipient", "")).lower()
+
+    if any(domain in recipient for domain in external_domains):
+    	score = max(score, 70)
+    	reasons.append("Email sent to external personal mailbox")
 
     managed_device = str(row.get("IsManagedDevice", "")).lower()
     if managed_device == "false":
@@ -596,6 +634,346 @@ def add_failed_logon_patterns(timeline):
 
     return output
 
+
+
+def build_potential_incident(
+    user,
+    pattern,
+    severity,
+    confidence_score,
+    events,
+    reason,
+    time_window_minutes,
+):
+    return {
+        "PrimaryUser": user,
+        "Pattern": pattern,
+        "Severity": severity,
+        "ConfidenceScore": confidence_score,
+        "FirstSeen": events["CreationDate"].min(),
+        "LastSeen": events["CreationDate"].max(),
+        "TimeWindowMinutes": time_window_minutes,
+        "SupportingOperations": ", ".join(
+            sorted(set(events["Operation"].dropna().astype(str)))
+        ),
+        "SupportingIPs": ", ".join(
+            sorted(set(events["NormalisedIPAddress"].dropna().astype(str)))
+        ),
+        "EventCount": len(events),
+        "Reason": reason,
+    }
+
+def find_events_within_time_window(user_events, operations, time_window_minutes):
+    events = user_events[
+        user_events["OperationLower"].isin(operations)
+    ].copy()
+
+    if events.empty:
+        return pd.DataFrame()
+
+    events["CreationDateParsed"] = pd.to_datetime(
+        events["CreationDate"],
+        errors="coerce",
+        utc=True,
+    )
+
+    events = events.dropna(subset=["CreationDateParsed"])
+
+    if events.empty:
+        return pd.DataFrame()
+
+    events = events.sort_values("CreationDateParsed")
+
+    for _, start_event in events.iterrows():
+        window_start = start_event["CreationDateParsed"]
+        window_end = window_start + pd.Timedelta(minutes=time_window_minutes)
+
+        window_events = events[
+            (events["CreationDateParsed"] >= window_start)
+            & (events["CreationDateParsed"] <= window_end)
+        ]
+
+        found_operations = set(window_events["OperationLower"].dropna())
+
+        if all(operation in found_operations for operation in operations):
+            return window_events.drop(columns=["CreationDateParsed"])
+
+    return pd.DataFrame()
+
+def detect_mass_downloads(user_events):
+    downloads = user_events[
+        user_events["OperationLower"] == "filedownloaded"
+    ].copy()
+
+    if downloads.empty:
+        return pd.DataFrame()
+
+    downloads["CreationDateParsed"] = pd.to_datetime(
+        downloads["CreationDate"],
+        errors="coerce",
+        utc=True,
+    )
+
+    downloads = downloads.dropna(subset=["CreationDateParsed"])
+    downloads = downloads.sort_values("CreationDateParsed")
+
+    for _, event in downloads.iterrows():
+        start = event["CreationDateParsed"]
+        end = start + pd.Timedelta(minutes=15)
+
+        window = downloads[
+            (downloads["CreationDateParsed"] >= start)
+            & (downloads["CreationDateParsed"] <= end)
+        ]
+
+        if len(window) >= 3:
+            return window.drop(columns=["CreationDateParsed"])
+
+    return pd.DataFrame()
+
+def detect_download_and_recycle(user_events):
+    operations = [
+        "filedownloaded",
+        "filerecycled",
+    ]
+
+    return find_events_within_time_window(
+        user_events=user_events,
+        operations=operations,
+        time_window_minutes=60,
+    )
+
+def create_potential_incidents(combined):
+    incidents = []
+
+    work = combined.copy()
+    work["OperationLower"] = work["Operation"].astype(str).str.lower()
+
+    for user, user_events in work.groupby("PrimaryUser"):
+        if not user:
+            continue
+
+        # Potential BEC:
+        # MailItemsAccessed + Inbox rule activity within 60 minutes
+        bec_events = find_events_within_time_window(
+            user_events=user_events,
+            operations=[
+                "mailitemsaccessed",
+                "new-inboxrule",
+            ],
+            time_window_minutes=60,
+        )
+
+        if bec_events.empty:
+            bec_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "mailitemsaccessed",
+                    "set-inboxrule",
+                ],
+                time_window_minutes=60,
+            )
+
+        if bec_events.empty:
+            bec_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "mailitemsaccessed",
+                    "updateinboxrules",
+                ],
+                time_window_minutes=60,
+            )
+
+        if not bec_events.empty:
+            incidents.append(
+                build_potential_incident(
+                    user=user,
+                    pattern="BEC-Related Activity",
+                    severity="Critical",
+                    confidence_score=95,
+                    events=bec_events,
+                    reason="Mailbox access and inbox rule activity observed within 60 minutes. Analyst review recommended.",
+                    time_window_minutes=60,
+                )
+            )
+
+        # Potential Mailbox Cleanup:
+        # MailItemsAccessed + HardDelete/SoftDelete within 60 minutes
+        cleanup_events = find_events_within_time_window(
+            user_events=user_events,
+            operations=[
+                "mailitemsaccessed",
+                "harddelete",
+            ],
+            time_window_minutes=60,
+        )
+
+        if cleanup_events.empty:
+            cleanup_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "mailitemsaccessed",
+                    "softdelete",
+                ],
+                time_window_minutes=60,
+            )
+
+        if cleanup_events.empty:
+            cleanup_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "mailitemsaccessed",
+                    "movetodeleteditems",
+                ],
+                time_window_minutes=60,
+            )
+
+        if not cleanup_events.empty:
+            incidents.append(
+                build_potential_incident(
+                    user=user,
+                    pattern="Mailbox Cleanup Activity",
+                    severity="High",
+                    confidence_score=85,
+                    events=cleanup_events,
+                    reason="Mailbox access and email deletion activity observed within 60 minutes. Analyst review recommended.",
+                    time_window_minutes=60,
+                )
+            )
+
+        # Potential Data Exfiltration:
+        # File download/sync + sharing activity within 120 minutes
+        data_exfil_events = find_events_within_time_window(
+            user_events=user_events,
+            operations=[
+                "filedownloaded",
+                "anonymouslinkcreated",
+            ],
+            time_window_minutes=120,
+        )
+
+        if data_exfil_events.empty:
+            data_exfil_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "filesyncdownloadedfull",
+                    "anonymouslinkcreated",
+                ],
+                time_window_minutes=120,
+            )
+
+        if data_exfil_events.empty:
+            data_exfil_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "filedownloaded",
+                    "sharingset",
+                ],
+                time_window_minutes=120,
+            )
+
+        if data_exfil_events.empty:
+            data_exfil_events = find_events_within_time_window(
+                user_events=user_events,
+                operations=[
+                    "filesyncdownloadedfull",
+                    "sharingset",
+                ],
+                time_window_minutes=120,
+            )
+
+        if not data_exfil_events.empty:
+            incidents.append(
+                build_potential_incident(
+                    user=user,
+                    pattern="Potential Data Exfiltration",
+                    severity="High",
+                    confidence_score=85,
+                    events=data_exfil_events,
+                    reason="File download or sync activity and sharing activity observed for the same user within 120 minutes.",
+                    time_window_minutes=120,
+                )
+            )
+
+        # Potential Password Spray / Brute Force:
+        # 5+ failed logons for the same user within 30 minutes
+        failed_logons = user_events[
+            user_events["OperationLower"] == "userloggedinfailed"
+        ].copy()
+
+        if not failed_logons.empty:
+            failed_logons["CreationDateParsed"] = pd.to_datetime(
+                failed_logons["CreationDate"],
+                errors="coerce",
+                utc=True,
+            )
+
+            failed_logons = failed_logons.dropna(subset=["CreationDateParsed"])
+            failed_logons = failed_logons.sort_values("CreationDateParsed")
+
+            for _, start_event in failed_logons.iterrows():
+                window_start = start_event["CreationDateParsed"]
+                window_end = window_start + pd.Timedelta(minutes=30)
+
+                window_events = failed_logons[
+                    (failed_logons["CreationDateParsed"] >= window_start)
+                    & (failed_logons["CreationDateParsed"] <= window_end)
+                ]
+
+                if len(window_events) >= 5:
+                    incidents.append(
+                        build_potential_incident(
+                            user=user,
+                            pattern="Potential Password Spray / Brute Force",
+                            severity="High",
+                            confidence_score=75,
+                            events=window_events.drop(columns=["CreationDateParsed"]),
+                            reason="Five or more failed login events observed for the same user within 30 minutes.",
+                            time_window_minutes=30,
+                        )
+                    )
+                    break
+		
+	# Mass file download detection
+
+        mass_download_events = detect_mass_downloads(user_events)
+
+        if not mass_download_events.empty:
+            incidents.append(
+                build_potential_incident(
+                    user=user,
+                    pattern="Potential Data Exfiltration",
+                    severity="High",
+                    confidence_score=80,
+                    events=mass_download_events,
+                    reason="Multiple file downloads observed within 15 minutes. Review recommended.",
+                    time_window_minutes=15,
+                )
+            )
+
+        # Download and recycle detection
+
+        recycle_events = detect_download_and_recycle(user_events)
+
+        if not recycle_events.empty:
+            incidents.append(
+                build_potential_incident(
+                    user=user,
+                    pattern="Potential Data Exfiltration",
+                    severity="High",
+                    confidence_score=85,
+                    events=recycle_events,
+                    reason="File download and recycle activity observed within 60 minutes. Review recommended.",
+                    time_window_minutes=60,
+                )
+            )
+
+    if not incidents:
+        return pd.DataFrame(columns=POTENTIAL_INCIDENTS_COLUMNS)
+
+    output = pd.DataFrame(incidents)
+    return ensure_columns(output, POTENTIAL_INCIDENTS_COLUMNS)
+
 def main():
     OUTPUT_FILE.parent.mkdir(exist_ok=True)
 
@@ -659,6 +1037,7 @@ def main():
 
     investigation_timeline = create_investigation_timeline(combined)
     suspicious_activity = create_suspicious_activity(investigation_timeline)
+    potential_incidents = create_potential_incidents(combined)
 
     mail_items_accessed = combined[
         combined["Operation"].astype(str).str.lower() == "mailitemsaccessed"
@@ -746,53 +1125,55 @@ def main():
     ].copy()
 
     stats = pd.DataFrame(
-        {
-            "Metric": [
-                "Total Events",
-                "Investigation Timeline Events",
-                "Suspicious Activity Events",
-                "Exchange Investigation Events",
-                "Inbox Rule Events",
-                "SharePoint-OneDrive Investigation Events",
-                "AzureAD Investigation Events",
-                "Teams Events",
-                "Unknown-Unparsed Events",
-                "Events With IP Address",
-                "Events Without IP Address",
-                "Unique IP Addresses",
-                "Events With Primary User",
-                "Events Without Primary User",
-                "Events With Timestamp",
-                "Events Without Timestamp",
-                "JSON Parse Errors",
-                "MailItemsAccessed Total",
-                "MailItemsAccessed Bind",
-                "MailItemsAccessed Sync",
-            ],
-            "Count": [
-                len(combined),
-                len(investigation_timeline),
-                len(suspicious_activity),
-                len(exchange_investigation),
-                len(inbox_rules),
-                len(spod_output),
-                len(azure_ad_events),
-                len(teams_output),
-                len(combined[combined["ParserConnector"] == "Unknown-Unparsed"]),
-                len(combined[combined["NormalisedIPAddress"] != ""]),
-                len(combined[combined["NormalisedIPAddress"] == ""]),
-                len(ip_analysis),
-                len(combined[combined["PrimaryUser"] != ""]),
-                len(combined[combined["PrimaryUser"] == ""]),
-                len(combined[combined["EventTimestamp"] != ""]),
-                len(combined[combined["EventTimestamp"] == ""]),
-                len(parser_errors),
-                len(mail_items_accessed),
-                len(mail_items_bind),
-                len(mail_items_sync),
-            ],
-        }
-    )
+    {
+        "Metric": [
+            "Total Events",
+            "Investigation Timeline Events",
+            "Suspicious Activity Events",
+            "Potential Incidents",
+            "Exchange Investigation Events",
+            "Inbox Rule Events",
+            "SharePoint-OneDrive Investigation Events",
+            "AzureAD Investigation Events",
+            "Teams Events",
+            "Unknown-Unparsed Events",
+            "Events With IP Address",
+            "Events Without IP Address",
+            "Unique IP Addresses",
+            "Events With Primary User",
+            "Events Without Primary User",
+            "Events With Timestamp",
+            "Events Without Timestamp",
+            "JSON Parse Errors",
+            "MailItemsAccessed Total",
+            "MailItemsAccessed Bind",
+            "MailItemsAccessed Sync",
+        ],
+        "Count": [
+            len(combined),
+            len(investigation_timeline),
+            len(suspicious_activity),
+            len(potential_incidents),
+            len(exchange_investigation),
+            len(inbox_rules),
+            len(spod_output),
+            len(azure_ad_events),
+            len(teams_output),
+            len(combined[combined["ParserConnector"] == "Unknown-Unparsed"]),
+            len(combined[combined["NormalisedIPAddress"] != ""]),
+            len(combined[combined["NormalisedIPAddress"] == ""]),
+            len(ip_analysis),
+            len(combined[combined["PrimaryUser"] != ""]),
+            len(combined[combined["PrimaryUser"] == ""]),
+            len(combined[combined["EventTimestamp"] != ""]),
+            len(combined[combined["EventTimestamp"] == ""]),
+            len(parser_errors),
+            len(mail_items_accessed),
+            len(mail_items_bind),
+            len(mail_items_sync),
+        ],
+    }
+)
 
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
         stats.to_excel(writer, sheet_name="Parser Statistics", index=False)
@@ -800,6 +1181,7 @@ def main():
         ip_analysis.to_excel(writer, sheet_name="IP-Analysis", index=False)
         investigation_timeline.to_excel(writer, sheet_name="Investigation-Timeline", index=False)
         suspicious_activity.to_excel(writer, sheet_name="Suspicious-Activity", index=False)
+        potential_incidents.to_excel(writer, sheet_name="Potential-Incidents", index=False)
         combined.to_excel(writer, sheet_name="All Events", index=False)
         parser_errors.to_excel(writer, sheet_name="Parser Errors", index=False)
 
