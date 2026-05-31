@@ -93,6 +93,9 @@ POTENTIAL_INCIDENTS_COLUMNS = [
     "EventCount", "Reason",
 ]
 
+INVESTIGATION_SUMMARY_COLUMNS = [
+    "Metric", "Value",
+]
 
 def parse_audit_data(value):
     if pd.isna(value):
@@ -974,6 +977,164 @@ def create_potential_incidents(combined):
     output = pd.DataFrame(incidents)
     return ensure_columns(output, POTENTIAL_INCIDENTS_COLUMNS)
 
+def count_operations(df, operations):
+    return len(
+        df[
+            df["Operation"]
+            .astype(str)
+            .str.lower()
+            .isin([operation.lower() for operation in operations])
+        ]
+    )
+
+
+def get_highest_severity(values):
+    severity_rank = {
+        "Critical": 4,
+        "High": 3,
+        "Medium": 2,
+        "Low": 1,
+        "": 0,
+    }
+
+    values = [str(value) for value in values if str(value).strip()]
+
+    if not values:
+        return ""
+
+    return max(values, key=lambda value: severity_rank.get(value, 0))
+
+
+def create_investigation_summary(
+    combined,
+    investigation_timeline,
+    suspicious_activity,
+    potential_incidents,
+):
+    primary_users = sorted(
+        set(combined["PrimaryUser"].dropna().astype(str)) -
+        {""}
+    )
+
+    unique_ips = sorted(
+        set(combined["NormalisedIPAddress"].dropna().astype(str)) -
+        {""}
+    )
+
+    first_activity = combined["CreationDate"].min()
+    last_activity = combined["CreationDate"].max()
+
+    try:
+        first_dt = pd.to_datetime(first_activity, errors="coerce", utc=True)
+        last_dt = pd.to_datetime(last_activity, errors="coerce", utc=True)
+        duration_minutes = int((last_dt - first_dt).total_seconds() / 60)
+    except Exception:
+        duration_minutes = ""
+
+    indicators = []
+
+    if count_operations(combined, ["New-InboxRule", "Set-InboxRule", "UpdateInboxRules"]) > 0:
+        indicators.append("Inbox Rules")
+
+    if count_operations(combined, ["MailItemsAccessed"]) > 0:
+        indicators.append("Mailbox Access")
+
+    if count_operations(combined, ["SearchQueryInitiated"]) > 0:
+        indicators.append("Mailbox Search")
+
+    if count_operations(combined, ["HardDelete", "SoftDelete", "MoveToDeletedItems"]) > 0:
+        indicators.append("Mailbox Deletion")
+
+    if count_operations(combined, ["FileDownloaded", "FileSyncDownloadedFull"]) > 0:
+        indicators.append("File Download")
+
+    if count_operations(combined, ["FileRecycled"]) > 0:
+        indicators.append("File Recycled")
+
+    if count_operations(combined, ["AnonymousLinkCreated", "SharingSet"]) > 0:
+        indicators.append("Sharing or anonymous Links")
+
+    if count_operations(combined, ["Send"]) > 0:
+        indicators.append("Emails Sent")
+
+    if count_operations(combined, ["UserLoggedInFailed"]) > 0:
+        indicators.append("Failed Logins")
+
+    if len(potential_incidents) > 0:
+        indicators.append("Potential Incidents")
+
+    unmanaged_count = len(
+        combined[
+            combined.get("IsManagedDevice", pd.Series([""] * len(combined)))
+            .astype(str)
+            .str.lower()
+            == "false"
+        ]
+    )
+
+    if unmanaged_count > 0:
+        indicators.append("Unmanaged Device")
+
+    highest_severity = get_highest_severity(
+        list(suspicious_activity.get("Severity", [])) +
+        list(potential_incidents.get("Severity", []))
+    )
+
+    top_incident = ""
+    top_incident_severity = ""
+
+    if not potential_incidents.empty:
+       ranked_incidents = potential_incidents.copy()
+       ranked_incidents["SeverityRank"] = ranked_incidents["Severity"].map(
+           {
+                "Critical": 4,
+                "High": 3,
+                "Medium": 2,
+                "Low": 1,
+           }
+        ).fillna(0)
+
+       ranked_incidents = ranked_incidents.sort_values(
+            by=["SeverityRank", "ConfidenceScore"],
+            ascending=False,
+        )
+
+       top_incident = ranked_incidents.iloc[0]["Pattern"]
+       top_incident_severity = ranked_incidents.iloc[0]["Severity"]
+
+    summary_rows = [
+        [
+             "Primary User" if len(primary_users) == 1 else "Primary Users",
+             ", ".join(primary_users),
+        ],
+        ["First Activity", first_activity],
+        ["Last Activity", last_activity],
+        ["Activity Duration Minutes", duration_minutes],
+        ["Unique IP Count", len(unique_ips)],
+        ["Unique IPs", ", ".join(unique_ips)],
+        ["Potential Incidents", len(potential_incidents)],
+        ["Top Incident", top_incident],
+        ["Top Incident Severity", top_incident_severity],
+        ["Suspicious Activity Events", len(suspicious_activity)],
+        ["Highest Severity", highest_severity],
+        ["Successful Logins", count_operations(combined, ["UserLoggedIn"])],
+        ["Failed Logins", count_operations(combined, ["UserLoggedInFailed"])],
+        ["Unmanaged Device Events", unmanaged_count],
+        ["MailItemsAccessed Events", count_operations(combined, ["MailItemsAccessed"])],
+        ["Inbox Rule Events", count_operations(combined, ["New-InboxRule", "Set-InboxRule", "UpdateInboxRules"])],
+        ["Mailbox Search Events", count_operations(combined, ["SearchQueryInitiated"])],
+        ["Emails Sent", count_operations(combined, ["Send"])],
+        ["Hard Deletes", count_operations(combined, ["HardDelete"])],
+        ["Soft Deletes", count_operations(combined, ["SoftDelete"])],
+        ["Files Accessed", count_operations(combined, ["FileAccessed"])],
+        ["Files Downloaded", count_operations(combined, ["FileDownloaded", "FileSyncDownloadedFull"])],
+        ["Files Recycled", count_operations(combined, ["FileRecycled"])],
+        ["Sharing Events", count_operations(combined, ["AnonymousLinkCreated", "SharingSet"])],
+        ["Investigation Indicators", "; ".join(indicators)],
+    ]
+
+    return pd.DataFrame(summary_rows, columns=INVESTIGATION_SUMMARY_COLUMNS)
+
 def main():
     OUTPUT_FILE.parent.mkdir(exist_ok=True)
 
@@ -1038,6 +1199,13 @@ def main():
     investigation_timeline = create_investigation_timeline(combined)
     suspicious_activity = create_suspicious_activity(investigation_timeline)
     potential_incidents = create_potential_incidents(combined)
+
+    investigation_summary = create_investigation_summary(
+    	combined,
+    	investigation_timeline,
+    	suspicious_activity,
+    	potential_incidents,
+    )
 
     mail_items_accessed = combined[
         combined["Operation"].astype(str).str.lower() == "mailitemsaccessed"
@@ -1177,6 +1345,7 @@ def main():
 
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
         stats.to_excel(writer, sheet_name="Parser Statistics", index=False)
+        investigation_summary.to_excel(writer, sheet_name="Investigation-Summary", index=False)
         workload_summary.to_excel(writer, sheet_name="Workload Summary", index=False)
         ip_analysis.to_excel(writer, sheet_name="IP-Analysis", index=False)
         investigation_timeline.to_excel(writer, sheet_name="Investigation-Timeline", index=False)
